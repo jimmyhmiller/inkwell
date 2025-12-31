@@ -4,6 +4,9 @@ use llvm_sys::execution_engine::{
     LLVMFreeMachineCodeForFunction, LLVMGenericValueRef, LLVMGetExecutionEngineTargetData, LLVMGetFunctionAddress,
     LLVMLinkInInterpreter, LLVMLinkInMCJIT, LLVMRemoveModule, LLVMRunFunction, LLVMRunFunctionAsMain,
     LLVMRunStaticConstructors, LLVMRunStaticDestructors,
+    // Memory manager support
+    LLVMCreateSimpleMCJITMemoryManager, LLVMMCJITMemoryManagerRef,
+    LLVMMCJITCompilerOptions, LLVMCreateMCJITCompilerForModule, LLVMInitializeMCJITCompilerOptions,
 };
 
 use crate::context::Context;
@@ -18,8 +21,118 @@ use std::marker::PhantomData;
 use std::mem::{forget, size_of, transmute_copy, MaybeUninit};
 use std::ops::Deref;
 use std::rc::Rc;
+use llvm_sys::prelude::LLVMBool;
+use llvm_sys::target_machine::LLVMCodeModel;
 
 static EE_INNER_PANIC: &str = "ExecutionEngineInner should exist until Drop";
+
+/// Callbacks for custom MCJIT memory manager.
+///
+/// This allows intercepting memory allocations during JIT compilation,
+/// which is essential for capturing stackmap sections.
+#[derive(Clone, Copy)]
+pub struct MCJITMemoryManagerCallbacks {
+    /// Called when MCJIT allocates a code section
+    pub allocate_code_section: extern "C" fn(
+        opaque: *mut libc::c_void,
+        size: libc::uintptr_t,
+        alignment: libc::c_uint,
+        section_id: libc::c_uint,
+        section_name: *const libc::c_char,
+    ) -> *mut u8,
+
+    /// Called when MCJIT allocates a data section (including __llvm_stackmaps)
+    pub allocate_data_section: extern "C" fn(
+        opaque: *mut libc::c_void,
+        size: libc::uintptr_t,
+        alignment: libc::c_uint,
+        section_id: libc::c_uint,
+        section_name: *const libc::c_char,
+        is_read_only: LLVMBool,
+    ) -> *mut u8,
+
+    /// Called to finalize memory permissions
+    pub finalize_memory: extern "C" fn(
+        opaque: *mut libc::c_void,
+        err_msg: *mut *mut libc::c_char,
+    ) -> LLVMBool,
+
+    /// Called when the memory manager is destroyed (optional)
+    pub destroy: Option<extern "C" fn(opaque: *mut libc::c_void)>,
+}
+
+impl Debug for MCJITMemoryManagerCallbacks {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCJITMemoryManagerCallbacks")
+            .field("allocate_code_section", &"<fn>")
+            .field("allocate_data_section", &"<fn>")
+            .field("finalize_memory", &"<fn>")
+            .field("destroy", &self.destroy.map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+/// A wrapper around LLVM's MCJIT memory manager
+pub struct MCJITMemoryManager {
+    memory_manager: LLVMMCJITMemoryManagerRef,
+}
+
+impl Debug for MCJITMemoryManager {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCJITMemoryManager")
+            .field("memory_manager", &self.memory_manager)
+            .finish()
+    }
+}
+
+impl MCJITMemoryManager {
+    /// Create a custom MCJIT memory manager with the provided callbacks.
+    ///
+    /// The `opaque` pointer will be passed to all callbacks and can be used
+    /// to store custom state (like captured section addresses).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `opaque` remains valid for the lifetime
+    /// of the memory manager, and that the callbacks are safe to call.
+    pub unsafe fn new(opaque: *mut libc::c_void, callbacks: MCJITMemoryManagerCallbacks) -> Option<Self> {
+        let mm = LLVMCreateSimpleMCJITMemoryManager(
+            opaque,
+            callbacks.allocate_code_section,
+            callbacks.allocate_data_section,
+            callbacks.finalize_memory,
+            callbacks.destroy,
+        );
+
+        if mm.is_null() {
+            None
+        } else {
+            Some(MCJITMemoryManager { memory_manager: mm })
+        }
+    }
+
+    /// Get the raw LLVM memory manager reference
+    pub fn as_raw(&self) -> LLVMMCJITMemoryManagerRef {
+        self.memory_manager
+    }
+}
+
+impl Drop for MCJITMemoryManager {
+    fn drop(&mut self) {
+        // Note: The memory manager is typically consumed by the execution engine
+        // and should not be disposed separately. Only dispose if not attached.
+        // For safety, we don't dispose here - the EE takes ownership.
+    }
+}
+
+/// Options for creating an MCJIT execution engine
+#[derive(Debug, Clone)]
+pub struct MCJITCompilerOptions {
+    pub opt_level: u32,
+    pub code_model: LLVMCodeModel,
+    pub no_frame_pointer_elim: bool,
+    pub enable_fast_isel: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FunctionLookupError {
@@ -429,6 +542,76 @@ impl<'ctx> ExecutionEngine<'ctx> {
     // REVIEW: Is this actually safe? Can you double destruct/free?
     pub fn run_static_destructors(&self) {
         unsafe { LLVMRunStaticDestructors(self.execution_engine_inner()) }
+    }
+
+    /// Create an MCJIT execution engine with a custom memory manager.
+    ///
+    /// This allows intercepting memory allocations during JIT compilation,
+    /// which is essential for capturing stackmap sections for GC support.
+    ///
+    /// # Safety
+    ///
+    /// The memory manager's opaque pointer and callbacks must remain valid
+    /// for the lifetime of the execution engine.
+    pub unsafe fn create_mcjit_with_memory_manager(
+        module: &Module<'ctx>,
+        memory_manager: MCJITMemoryManager,
+        options: Option<MCJITCompilerOptions>,
+    ) -> Result<ExecutionEngine<'ctx>, LLVMString> {
+        use crate::targets::{InitializationConfig, Target};
+
+        Target::initialize_native(&InitializationConfig::default()).map_err(|mut err_string| {
+            err_string.push('\0');
+            LLVMString::create_from_str(&err_string)
+        })?;
+
+        if module.owned_by_ee.borrow().is_some() {
+            let string = "This module is already owned by an ExecutionEngine.\0";
+            return Err(LLVMString::create_from_str(string));
+        }
+
+        // Initialize options
+        let mut llvm_options: LLVMMCJITCompilerOptions = MaybeUninit::zeroed().assume_init();
+        LLVMInitializeMCJITCompilerOptions(
+            &mut llvm_options,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+        );
+
+        // Set custom options if provided
+        if let Some(opts) = options {
+            llvm_options.OptLevel = opts.opt_level;
+            llvm_options.CodeModel = opts.code_model;
+            llvm_options.NoFramePointerElim = if opts.no_frame_pointer_elim { 1 } else { 0 };
+            llvm_options.EnableFastISel = if opts.enable_fast_isel { 1 } else { 0 };
+        }
+
+        // Set the memory manager
+        llvm_options.MCJMM = memory_manager.memory_manager;
+
+        // Prevent the memory manager from being dropped - EE takes ownership
+        std::mem::forget(memory_manager);
+
+        let mut execution_engine = MaybeUninit::uninit();
+        let mut err_string = MaybeUninit::uninit();
+
+        let code = LLVMCreateMCJITCompilerForModule(
+            execution_engine.as_mut_ptr(),
+            module.module.get(),
+            &mut llvm_options,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+            err_string.as_mut_ptr(),
+        );
+
+        if code == 1 {
+            return Err(LLVMString::new(err_string.assume_init()));
+        }
+
+        let execution_engine = execution_engine.assume_init();
+        let execution_engine = ExecutionEngine::new(Rc::new(execution_engine), true);
+
+        *module.owned_by_ee.borrow_mut() = Some(execution_engine.clone());
+
+        Ok(execution_engine)
     }
 }
 
